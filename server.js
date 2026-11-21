@@ -1,5 +1,7 @@
 const express = require("express");
 const cors = require("cors");
+const ffmpeg = require("@ffmpeg-installer/ffmpeg");
+const { spawn } = require("child_process");
 
 const app = express();
 app.use(cors());
@@ -294,6 +296,49 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, service: "hubcloud-4k-resolver" });
 });
 
+app.get("/stream", (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl) return res.status(400).send("Missing url");
+
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Cache-Control", "no-cache");
+
+  const args = [
+    "-hide_banner",
+    "-loglevel", "error",
+    "-user_agent", UA,
+    "-i", targetUrl,
+    "-c:v", "copy",
+    "-tag:v", "hvc1",
+    "-c:a", "aac",
+    "-b:a", "192k",
+    "-ac", "2",
+    "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+    "-f", "mp4",
+    "pipe:1",
+  ];
+
+  const proc = spawn(ffmpeg.path, args);
+  proc.stdout.pipe(res);
+
+  proc.stderr.on("data", (d) => {
+    console.warn("[ffmpeg /stream stderr]:", d.toString().slice(0, 200));
+  });
+
+  proc.on("error", (err) => {
+    console.error("[ffmpeg spawn error]:", err);
+    if (!res.headersSent) res.status(500).send("FFmpeg spawn error");
+  });
+
+  req.on("close", () => {
+    try {
+      proc.kill();
+    } catch {}
+  });
+});
+
 app.get("/resolve", async (req, res) => {
   const { title, year, type = "movie", season = 1, episode = 1 } = req.query;
   if (!title) {
@@ -309,7 +354,24 @@ app.get("/resolve", async (req, res) => {
       episode: Number(episode) || 1,
     });
 
-    return res.json({ ok: streams.length > 0, streams });
+    const host = req.get("host") || "hubcloud-resolver.onrender.com";
+    const proto = req.protocol === "http" && !host.includes("localhost") ? "https" : req.protocol;
+    const baseUrl = `${proto}://${host}`;
+
+    const formattedStreams = streams.map((s) => {
+      if (s.quality === "4K" || s.id === "hubcloud-4k") {
+        return {
+          ...s,
+          url: `${baseUrl}/stream?url=${encodeURIComponent(s.rawUrl || s.url)}`,
+          rawUrl: s.rawUrl || s.url,
+          type: "fmp4",
+          format: "fmp4",
+        };
+      }
+      return s;
+    });
+
+    return res.json({ ok: formattedStreams.length > 0, streams: formattedStreams });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
