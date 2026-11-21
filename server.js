@@ -309,7 +309,7 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, service: "hubcloud-4k-resolver", ffmpeg: Boolean(ffmpegPath) });
 });
 
-app.get("/debug", (req, res) => {
+app.get("/debug", async (req, res) => {
   try {
     let exists = false;
     if (ffmpegPath && fs.existsSync(ffmpegPath)) {
@@ -318,20 +318,19 @@ app.get("/debug", (req, res) => {
     }
     const versionRun = exists ? spawnSync(ffmpegPath, ["-version"]) : null;
     let urlTest = null;
-    if (exists && req.query.url) {
-      const p = spawnSync(ffmpegPath, [
-        "-hide_banner",
-        "-user_agent", UA,
-        "-i", req.query.url,
-        "-t", "1",
-        "-f", "null",
-        "-",
-      ], { timeout: 6000 });
-      urlTest = {
-        status: p.status,
-        stderr: p.stderr ? p.stderr.toString().slice(-1000) : null,
-        error: p.error ? p.error.message : null,
-      };
+    if (req.query.url) {
+      try {
+        const uRes = await fetch(req.query.url, {
+          headers: { "User-Agent": UA },
+          signal: AbortSignal.timeout(5000),
+        });
+        urlTest = {
+          status: uRes.status,
+          headers: Object.fromEntries(uRes.headers.entries()),
+        };
+      } catch (e) {
+        urlTest = { error: e.message };
+      }
     }
     res.json({
       platform: process.platform,
@@ -347,7 +346,7 @@ app.get("/debug", (req, res) => {
   }
 });
 
-app.get("/stream", (req, res) => {
+app.get("/stream", async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send("Missing url");
 
@@ -360,42 +359,95 @@ app.get("/stream", (req, res) => {
   res.setHeader("Access-Control-Allow-Headers", "*");
   res.setHeader("Cache-Control", "no-cache");
 
-  const args = [
-    "-hide_banner",
-    "-loglevel", "error",
-    "-threads", "1",
-    "-fflags", "nobuffer",
-    "-analyzeduration", "1000000",
-    "-probesize", "1000000",
-    "-user_agent", UA,
-    "-i", targetUrl,
-    "-c:v", "copy",
-    "-tag:v", "hvc1",
-    "-c:a", "aac",
-    "-b:a", "128k",
-    "-ac", "2",
-    "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-    "-f", "mp4",
-    "pipe:1",
-  ];
+  let proc = null;
+  let nodeStream = null;
+  const abortCtrl = new AbortController();
 
-  const proc = spawn(ffmpegPath, args);
-  proc.stdout.pipe(res);
+  const cleanup = () => {
+    try { abortCtrl.abort(); } catch {}
+    try { nodeStream?.destroy(); } catch {}
+    try { proc?.kill("SIGKILL"); } catch {}
+  };
 
-  proc.stderr.on("data", (d) => {
-    console.warn("[ffmpeg /stream stderr]:", d.toString().slice(0, 200));
-  });
+  req.on("close", cleanup);
+  res.on("close", cleanup);
 
-  proc.on("error", (err) => {
-    console.error("[ffmpeg spawn error]:", err);
-    if (!res.headersSent) res.status(500).send("FFmpeg spawn error");
-  });
+  try {
+    const upstream = await fetch(targetUrl, {
+      headers: {
+        "User-Agent": UA,
+        "Accept": "*/*",
+      },
+      signal: abortCtrl.signal,
+    });
 
-  req.on("close", () => {
-    try {
-      proc.kill();
-    } catch {}
-  });
+    if (!upstream.ok) {
+      console.error("[upstream error]:", upstream.status, upstream.statusText);
+      return res.status(502).send("Upstream returned " + upstream.status);
+    }
+
+    const args = [
+      "-hide_banner",
+      "-loglevel", "error",
+      "-threads", "1",
+      "-fflags", "nobuffer",
+      "-analyzeduration", "1000000",
+      "-probesize", "1000000",
+      "-i", "pipe:0",
+      "-c:v", "copy",
+      "-tag:v", "hvc1",
+      "-c:a", "aac",
+      "-b:a", "128k",
+      "-ac", "2",
+      "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+      "-f", "mp4",
+      "pipe:1",
+    ];
+
+    proc = spawn(ffmpegPath, args);
+
+    const { Readable } = require("stream");
+    if (upstream.body) {
+      if (typeof upstream.body.pipe === "function") {
+        nodeStream = upstream.body;
+      } else if (typeof Readable.fromWeb === "function") {
+        nodeStream = Readable.fromWeb(upstream.body);
+      }
+    }
+
+    if (!nodeStream) {
+      throw new Error("Unable to create stream from upstream body");
+    }
+
+    nodeStream.on("error", (e) => {
+      console.warn("[upstream stream error]:", e.message);
+      cleanup();
+    });
+
+    proc.stdin.on("error", (e) => {
+      if (e.code !== "EPIPE") console.warn("[ffmpeg stdin error]:", e.message);
+    });
+
+    proc.stdout.pipe(res);
+
+    proc.stderr.on("data", (d) => {
+      console.warn("[ffmpeg stderr]:", d.toString().slice(0, 200));
+    });
+
+    proc.on("error", (err) => {
+      console.error("[ffmpeg spawn error]:", err);
+      if (!res.headersSent) res.status(500).send("FFmpeg spawn error");
+      cleanup();
+    });
+
+    nodeStream.pipe(proc.stdin);
+  } catch (err) {
+    if (err.name !== "AbortError") {
+      console.error("[stream handler error]:", err);
+      if (!res.headersSent) res.status(500).send(err.message);
+    }
+    cleanup();
+  }
 });
 
 app.get("/resolve", async (req, res) => {
