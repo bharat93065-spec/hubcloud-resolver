@@ -1,7 +1,20 @@
 const express = require("express");
 const cors = require("cors");
-const ffmpeg = require("@ffmpeg-installer/ffmpeg");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
+const fs = require("fs");
+
+let ffmpegPath = null;
+try {
+  ffmpegPath = require("ffmpeg-static");
+} catch {}
+if (!ffmpegPath) {
+  try {
+    ffmpegPath = require("@ffmpeg-installer/ffmpeg")?.path;
+  } catch {}
+}
+if (!ffmpegPath) {
+  ffmpegPath = "ffmpeg";
+}
 
 const app = express();
 app.use(cors());
@@ -293,12 +306,54 @@ async function resolve4kHubStreams({ title, year, type = "movie", season = 1, ep
 }
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "hubcloud-4k-resolver" });
+  res.json({ ok: true, service: "hubcloud-4k-resolver", ffmpeg: Boolean(ffmpegPath) });
+});
+
+app.get("/debug", (req, res) => {
+  try {
+    let exists = false;
+    if (ffmpegPath && fs.existsSync(ffmpegPath)) {
+      exists = true;
+      try { fs.chmodSync(ffmpegPath, 0o755); } catch {}
+    }
+    const versionRun = exists ? spawnSync(ffmpegPath, ["-version"]) : null;
+    let urlTest = null;
+    if (exists && req.query.url) {
+      const p = spawnSync(ffmpegPath, [
+        "-hide_banner",
+        "-user_agent", UA,
+        "-i", req.query.url,
+        "-t", "1",
+        "-f", "null",
+        "-",
+      ], { timeout: 6000 });
+      urlTest = {
+        status: p.status,
+        stderr: p.stderr ? p.stderr.toString().slice(-1000) : null,
+        error: p.error ? p.error.message : null,
+      };
+    }
+    res.json({
+      platform: process.platform,
+      arch: process.arch,
+      ffmpegPath,
+      exists,
+      version: versionRun?.stdout ? versionRun.stdout.toString().split("\n")[0] : null,
+      spawnError: versionRun?.error ? versionRun.error.message : null,
+      urlTest,
+    });
+  } catch (err) {
+    res.json({ error: err.message, stack: err.stack });
+  }
 });
 
 app.get("/stream", (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send("Missing url");
+
+  if (ffmpegPath && fs.existsSync(ffmpegPath)) {
+    try { fs.chmodSync(ffmpegPath, 0o755); } catch {}
+  }
 
   res.setHeader("Content-Type", "video/mp4");
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -320,7 +375,7 @@ app.get("/stream", (req, res) => {
     "pipe:1",
   ];
 
-  const proc = spawn(ffmpeg.path, args);
+  const proc = spawn(ffmpegPath, args);
   proc.stdout.pipe(res);
 
   proc.stderr.on("data", (d) => {
