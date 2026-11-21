@@ -1,0 +1,16 @@
+{
+  "name": "hubcloud-4k-resolver",
+  "version": "1.0.0",
+  "description": "Lightweight 4K HubCloud Stream Resolver Microservice for 4movie.in",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
